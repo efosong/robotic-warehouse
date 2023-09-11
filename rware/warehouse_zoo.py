@@ -1,17 +1,23 @@
 import logging
 
+import functools
 from collections import defaultdict, OrderedDict
+from copy import copy
 import gym
 from gym import spaces
 
-from rware.utils import MultiAgentActionSpace, MultiAgentObservationSpace
+from gym.utils import seeding
+from pettingzoo import ParallelEnv
+from pettingzoo.utils import wrappers
+from pettingzoo.utils import parallel_to_aec
 
-from enum import Enum
 import numpy as np
 
 from typing import List, Tuple, Optional, Dict
 
 import networkx as nx
+
+from .warehouse import _VectorWriter, Action, Direction, RewardType, ObservationType, Entity, Agent, Shelf, ImageLayer
 
 _AXIS_Z = 0
 _AXIS_Y = 1
@@ -22,137 +28,35 @@ _COLLISION_LAYERS = 2
 _LAYER_AGENTS = 0
 _LAYER_SHELFS = 1
 
+def env(**kwargs):
+    env = raw_env(**kwargs)
+    env = wrappers.OrderEnforcingWrapper(env)
+    return env
 
-class _VectorWriter:
-    def __init__(self, size: int):
-        self.vector = np.zeros(size, dtype=np.float32)
-        self.idx = 0
+def parallel_env(**kwargs):
+    env = WarehouseZoo(**kwargs)
+    return env
 
-    def write(self, data):
-        data_size = len(data)
-        self.vector[self.idx : self.idx + data_size] = data
-        self.idx += data_size
-
-    def skip(self, bits):
-        self.idx += bits
-
-
-class Action(Enum):
-    NOOP = 0
-    FORWARD = 1
-    LEFT = 2
-    RIGHT = 3
-    TOGGLE_LOAD = 4
+def raw_env(**kwargs):
+    env = parallel_env(**kwargs)
+    env = parallel_to_aec(env)
+    return env
 
 
-class Direction(Enum):
-    UP = 0
-    DOWN = 1
-    LEFT = 2
-    RIGHT = 3
+class WarehouseZoo(ParallelEnv):
 
-
-class RewardType(Enum):
-    GLOBAL = 0
-    INDIVIDUAL = 1
-    TWO_STAGE = 2
-
-
-class ObservationType(Enum):
-    DICT = 0
-    FLATTENED = 1
-    IMAGE = 2
-
-class ImageLayer(Enum):
-    """
-    Input layers of image-style observations
-    """
-    SHELVES = 0 # binary layer indicating shelves (also indicates carried shelves)
-    REQUESTS = 1 # binary layer indicating requested shelves
-    AGENTS = 2 # binary layer indicating agents in the environment (no way to distinguish agents)
-    AGENT_DIRECTION = 3 # layer indicating agent directions as int (see Direction enum + 1 for values)
-    AGENT_LOAD = 4 # binary layer indicating agents with load
-    GOALS = 5 # binary layer indicating goal/ delivery locations
-    ACCESSIBLE = 6 # binary layer indicating accessible cells (all but occupied cells/ out of map)
-
-
-class Entity:
-    def __init__(self, id_: int, x: int, y: int):
-        self.id = id_
-        self.prev_x = None
-        self.prev_y = None
-        self.x = x
-        self.y = y
-
-
-class Agent(Entity):
-    counter = 0
-
-    def __init__(self, x: int, y: int, dir_: Direction, msg_bits: int):
-        Agent.counter += 1
-        super().__init__(Agent.counter, x, y)
-        self.dir = dir_
-        self.message = np.zeros(msg_bits)
-        self.req_action: Optional[Action] = None
-        self.carrying_shelf: Optional[Shelf] = None
-        self.canceled_action = None
-        self.has_delivered = False
-
-    @property
-    def collision_layers(self):
-        if self.loaded:
-            return (_LAYER_AGENTS, _LAYER_SHELFS)
-        else:
-            return (_LAYER_AGENTS,)
-
-    def req_location(self, grid_size) -> Tuple[int, int]:
-        if self.req_action != Action.FORWARD:
-            return self.x, self.y
-        elif self.dir == Direction.UP:
-            return self.x, max(0, self.y - 1)
-        elif self.dir == Direction.DOWN:
-            return self.x, min(grid_size[0] - 1, self.y + 1)
-        elif self.dir == Direction.LEFT:
-            return max(0, self.x - 1), self.y
-        elif self.dir == Direction.RIGHT:
-            return min(grid_size[1] - 1, self.x + 1), self.y
-
-        raise ValueError(
-            f"Direction is {self.dir}. Should be one of {[v for v in Direction]}"
-        )
-
-    def req_direction(self) -> Direction:
-        wraplist = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-        if self.req_action == Action.RIGHT:
-            return wraplist[(wraplist.index(self.dir) + 1) % len(wraplist)]
-        elif self.req_action == Action.LEFT:
-            return wraplist[(wraplist.index(self.dir) - 1) % len(wraplist)]
-        else:
-            return self.dir
-
-
-class Shelf(Entity):
-    counter = 0
-
-    def __init__(self, x, y):
-        Shelf.counter += 1
-        super().__init__(Shelf.counter, x, y)
-
-    @property
-    def collision_layers(self):
-        return (_LAYER_SHELFS,)
-
-
-class Warehouse(gym.Env):
-
-    metadata = {"render.modes": ["human", "rgb_array"]}
+    metadata = {
+        "name": "rware",
+        "render.modes": ["human", "rgb_array"],
+        "render_fps": 4,
+        }
 
     def __init__(
         self,
         shelf_columns: int,
         column_height: int,
         shelf_rows: int,
-        n_agents: int,
+        num_agents,
         msg_bits: int,
         sensor_range: int,
         request_queue_size: int,
@@ -209,8 +113,8 @@ class Warehouse(gym.Env):
         :type column_height: int
         :param shelf_rows: Number of columns in the warehouse
         :type shelf_rows: int
-        :param n_agents: Number of spawned and controlled agents
-        :type n_agents: int
+        :param num_agents: Number of spawned and controlled agents
+        :type num_agents: int
         :param msg_bits: Number of communication bits for each agent
         :type msg_bits: int
         :param sensor_range: Range of each agents observation
@@ -242,12 +146,13 @@ class Warehouse(gym.Env):
         else:
             self._make_layout_from_str(layout)
 
-        self.n_agents = n_agents
         self.msg_bits = msg_bits
         self.sensor_range = sensor_range
         self.max_inactivity_steps: Optional[int] = max_inactivity_steps
         self.reward_type = reward_type
         self.reward_range = (0, 1)
+
+        self.possible_agents = [f"agent_{i}" for i in range(num_agents)]
 
         self._cur_inactive_steps = None
         self._cur_steps = 0
@@ -255,33 +160,32 @@ class Warehouse(gym.Env):
         
         self.normalised_coordinates = normalised_coordinates
 
-        sa_action_space = [len(Action), *msg_bits * (2,)]
-        if len(sa_action_space) == 1:
-            sa_action_space = spaces.Discrete(sa_action_space[0])
-        else:
-            sa_action_space = spaces.MultiDiscrete(sa_action_space)
-        self.action_space = spaces.Tuple(tuple(n_agents * [sa_action_space]))
-
         self.request_queue_size = request_queue_size
         self.request_queue = []
 
-        self.agents: List[Agent] = []
+        self.agents = copy(self.possible_agents)
+        self.agents_obj = {}
 
-        # default values:
-        self.fast_obs = None
-        self.image_obs = None
-        self.observation_space = None
         if observation_type == ObservationType.IMAGE:
-            self._use_image_obs(image_observation_layers, image_observation_directional)
+            self.image_obs = True
+            self.fast_obs = False
+            self.image_observation_directional = image_observation_directional
+            self.image_observation_layers = image_observation_layers
         else:
             # used for DICT observation type and needed as preceeding stype to generate
             # FLATTENED observations as well
-            self._use_slow_obs()
-
-        # for performance reasons we
-        # can flatten the obs vector
-        if observation_type == ObservationType.FLATTENED:
-            self._use_fast_obs()
+            self.image_obs = False
+            self.fast_obs = (observation_type == ObservationType.FLATTENED)
+            self._obs_bits_for_self = 4 + len(Direction)
+            self._obs_bits_per_agent = 1 + len(Direction) + self.msg_bits
+            self._obs_bits_per_shelf = 2
+            self._obs_bits_for_requests = 2
+            self._obs_sensor_locations = (1 + 2 * self.sensor_range) ** 2
+            self._obs_length = (
+                self._obs_bits_for_self
+                + self._obs_sensor_locations * self._obs_bits_per_agent
+                + self._obs_sensor_locations * self._obs_bits_per_shelf
+            )
 
         self.renderer = None
 
@@ -338,136 +242,11 @@ class Warehouse(gym.Env):
 
         assert len(self.goals) >= 1, "At least one goal is required"
 
-    def _use_image_obs(self, image_observation_layers, directional=True):
-        """
-        Set image observation space
-        :param image_observation_layers (List[ImageLayer]): list of layers to use as image channels
-        :param directional (bool): flag whether observations should be directional (pointing in
-            direction of agent or north-wise)
-        """
-        self.image_obs = True
-        self.fast_obs = False
-        self.image_observation_directional = directional
-        self.image_observation_layers = image_observation_layers
-
-        observation_shape = (1 + 2 * self.sensor_range, 1 + 2 * self.sensor_range)
-
-        layers_min = []
-        layers_max = []
-        for layer in image_observation_layers:
-            if layer == ImageLayer.AGENT_DIRECTION:
-                # directions as int
-                layer_min = np.zeros(observation_shape, dtype=np.float32)
-                layer_max = np.ones(observation_shape, dtype=np.float32) * max([d.value + 1 for d in Direction])
-            else:
-                # binary layer
-                layer_min = np.zeros(observation_shape, dtype=np.float32)
-                layer_max = np.ones(observation_shape, dtype=np.float32)
-            layers_min.append(layer_min)
-            layers_max.append(layer_max)
-
-        # total observation
-        min_obs = np.stack(layers_min)
-        max_obs = np.stack(layers_max)
-        self.observation_space = spaces.Tuple(
-            tuple([spaces.Box(min_obs, max_obs, dtype=np.float32)] * self.n_agents)
-        )
-
-    def _use_slow_obs(self):
-        self.fast_obs = False
-
-        self._obs_bits_for_self = 4 + len(Direction)
-        self._obs_bits_per_agent = 1 + len(Direction) + self.msg_bits
-        self._obs_bits_per_shelf = 2
-        self._obs_bits_for_requests = 2
-
-        self._obs_sensor_locations = (1 + 2 * self.sensor_range) ** 2
-
-        self._obs_length = (
-            self._obs_bits_for_self
-            + self._obs_sensor_locations * self._obs_bits_per_agent
-            + self._obs_sensor_locations * self._obs_bits_per_shelf
-        )
-
-        if self.normalised_coordinates:
-            location_space = spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(2,),
-                    dtype=np.float32,
-            )
-        else:
-            location_space = spaces.MultiDiscrete(
-                [self.grid_size[1], self.grid_size[0]]
-            )
-
-        self.observation_space = spaces.Tuple(
-            tuple(
-                [
-                    spaces.Dict(
-                        OrderedDict(
-                            {
-                                "self": spaces.Dict(
-                                    OrderedDict(
-                                        {
-                                            "location": location_space,
-                                            "carrying_shelf": spaces.MultiDiscrete([2]),
-                                            "direction": spaces.Discrete(4),
-                                            "on_highway": spaces.MultiBinary(1),
-                                        }
-                                    )
-                                ),
-                                "sensors": spaces.Tuple(
-                                    self._obs_sensor_locations
-                                    * (
-                                        spaces.Dict(
-                                            OrderedDict(
-                                                {
-                                                    "has_agent": spaces.MultiBinary(1),
-                                                    "direction": spaces.Discrete(4),
-                                                    "local_message": spaces.MultiBinary(
-                                                        self.msg_bits
-                                                    ),
-                                                    "has_shelf": spaces.MultiBinary(1),
-                                                    "shelf_requested": spaces.MultiBinary(
-                                                        1
-                                                    ),
-                                                }
-                                            )
-                                        ),
-                                    )
-                                ),
-                            }
-                        )
-                    )
-                    for _ in range(self.n_agents)
-                ]
-            )
-        )
-
-    def _use_fast_obs(self):
-        if self.fast_obs:
-            return
-
-        self.fast_obs = True
-        ma_spaces = []
-        for sa_obs in self.observation_space:
-            flatdim = spaces.flatdim(sa_obs)
-            ma_spaces += [
-                spaces.Box(
-                    low=-float("inf"),
-                    high=float("inf"),
-                    shape=(flatdim,),
-                    dtype=np.float32,
-                )
-            ]
-
-        self.observation_space = spaces.Tuple(tuple(ma_spaces))
-
     def _is_highway(self, x: int, y: int) -> bool:
         return self.highways[y, x]
 
-    def _make_obs(self, agent):
+    def _make_obs(self, agent_id):
+        agent = self.agents_obj[agent_id]
         if self.image_obs:
             # write image observations
             if agent.id == 1:
@@ -478,41 +257,32 @@ class Warehouse(gym.Env):
                         layer = self.grid[_LAYER_SHELFS].copy().astype(np.float32)
                         # set all occupied shelf cells to 1.0 (instead of shelf ID)
                         layer[layer > 0.0] = 1.0
-                        # print("SHELVES LAYER")
                     elif layer_type == ImageLayer.REQUESTS:
                         layer = np.zeros(self.grid_size, dtype=np.float32)
                         for requested_shelf in self.request_queue:
                             layer[requested_shelf.y, requested_shelf.x] = 1.0
-                        # print("REQUESTS LAYER")
                     elif layer_type == ImageLayer.AGENTS:
                         layer = self.grid[_LAYER_AGENTS].copy().astype(np.float32)
                         # set all occupied agent cells to 1.0 (instead of agent ID)
                         layer[layer > 0.0] = 1.0
-                        # print("AGENTS LAYER")
                     elif layer_type == ImageLayer.AGENT_DIRECTION:
                         layer = np.zeros(self.grid_size, dtype=np.float32)
-                        for ag in self.agents:
+                        for ag in self.agents_obj.values():
                             agent_direction = ag.dir.value + 1
                             layer[ag.x, ag.y] = float(agent_direction)
-                        # print("AGENT DIRECTIONS LAYER")
                     elif layer_type == ImageLayer.AGENT_LOAD:
                         layer = np.zeros(self.grid_size, dtype=np.float32)
-                        for ag in self.agents:
+                        for ag in self.agents_obj.values():
                             if ag.carrying_shelf is not None:
                                 layer[ag.x, ag.y] = 1.0
-                        # print("AGENT LOAD LAYER")
                     elif layer_type == ImageLayer.GOALS:
                         layer = np.zeros(self.grid_size, dtype=np.float32)
                         for goal_y, goal_x in self.goals:
                             layer[goal_x, goal_y] = 1.0
-                        # print("GOALS LAYER")
                     elif layer_type == ImageLayer.ACCESSIBLE:
                         layer = np.ones(self.grid_size, dtype=np.float32)
-                        for ag in self.agents:
+                        for ag in self.agents_obj.values():
                             layer[ag.y, ag.x] = 0.0
-                        # print("ACCESSIBLE LAYER")
-                    # print(layer)
-                    # print()
                     # pad with 0s for out-of-map cells
                     layer = np.pad(layer, self.sensor_range, mode="constant")
                     layers.append(layer)
@@ -573,7 +343,7 @@ class Warehouse(gym.Env):
 
         if self.fast_obs:
             # write flattened observations
-            obs = _VectorWriter(self.observation_space[agent.id - 1].shape[0])
+            obs = _VectorWriter(self.observation_space(agent_id).shape[0])
 
             if self.normalised_coordinates:
                 agent_x = agent.x / (self.grid_size[1] - 1)
@@ -596,10 +366,10 @@ class Warehouse(gym.Env):
                 else:
                     obs.write([1.0])
                     direction = np.zeros(4)
-                    direction[self.agents[id_agent - 1].dir.value] = 1.0
+                    direction[self.agents_obj[self.agents[id_agent - 1]].dir.value] = 1.0
                     obs.write(direction)
                     if self.msg_bits > 0:
-                        obs.write(self.agents[id_agent - 1].message)
+                        obs.write(self.agents_obj[self.agents[id_agent - 1]].message)
                 if id_shelf == 0:
                     obs.skip(2)
                 else:
@@ -632,11 +402,13 @@ class Warehouse(gym.Env):
             if id_ == 0:
                 obs["sensors"][i]["has_agent"] = [0]
                 obs["sensors"][i]["direction"] = 0
-                obs["sensors"][i]["local_message"] = self.msg_bits * [0]
+                if self.msg_bits > 0:
+                    obs["sensors"][i]["local_message"] = self.msg_bits * [0]
             else:
                 obs["sensors"][i]["has_agent"] = [1]
-                obs["sensors"][i]["direction"] = self.agents[id_ - 1].dir.value
-                obs["sensors"][i]["local_message"] = self.agents[id_ - 1].message
+                obs["sensors"][i]["direction"] = self.agents_obj[self.agents[id_ - 1]].dir.value
+                if self.msg_bits > 0:
+                    obs["sensors"][i]["local_message"] = self.agents_obj[self.agents[id_ - 1]].message
 
         # find neighboring shelfs:
         for i, id_ in enumerate(shelfs):
@@ -656,17 +428,19 @@ class Warehouse(gym.Env):
         for s in self.shelfs:
             self.grid[_LAYER_SHELFS, s.y, s.x] = s.id
 
-        for a in self.agents:
+        for a in self.agents_obj.values():
             self.grid[_LAYER_AGENTS, a.y, a.x] = a.id
 
-    def reset(self):
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[Dict] = None,
+    ):
+        self.seed(seed)
         Shelf.counter = 0
         Agent.counter = 0
         self._cur_inactive_steps = 0
         self._cur_steps = 0
-
-        # n_xshelf = (self.grid_size[1] - 1) // 3
-        # n_yshelf = (self.grid_size[0] - 2) // 9
 
         # make the shelfs
         self.shelfs = [
@@ -679,36 +453,34 @@ class Warehouse(gym.Env):
         ]
 
         # spawn agents at random locations
-        agent_locs = np.random.choice(
+        agent_locs = self.np_random.choice(
             np.arange(self.grid_size[0] * self.grid_size[1]),
-            size=self.n_agents,
+            size=self.max_num_agents,
             replace=False,
         )
         agent_locs = np.unravel_index(agent_locs, self.grid_size)
         # and direction
-        agent_dirs = np.random.choice([d for d in Direction], size=self.n_agents)
-        self.agents = [
+        agent_dirs = self.np_random.choice([d for d in Direction], size=self.max_num_agents)
+        self.agents = copy(self.possible_agents)
+        agents_obj_list = [
             Agent(x, y, dir_, self.msg_bits)
             for y, x, dir_ in zip(*agent_locs, agent_dirs)
         ]
+        self.agents_obj = dict(zip(self.agents, agents_obj_list))
 
         self._recalc_grid()
 
         self.request_queue = list(
-            np.random.choice(self.shelfs, size=self.request_queue_size, replace=False)
+            self.np_random.choice(self.shelfs, size=self.request_queue_size, replace=False)
         )
 
-        return tuple([self._make_obs(agent) for agent in self.agents])
-        # for s in self.shelfs:
-        #     self.grid[0, s.y, s.x] = 1
-        # print(self.grid[0])
+        return {agent: self._make_obs(agent) for agent in self.agents}
 
-    def step(
-        self, actions: List[Action]
-    ) -> Tuple[List[np.ndarray], List[float], List[bool], Dict]:
+    def step(self, actions):
         assert len(actions) == len(self.agents)
 
-        for agent, action in zip(self.agents, actions):
+        for agent_id, action in actions.items():
+            agent = self.agents_obj[agent_id]
             if self.msg_bits > 0:
                 agent.req_action = Action(action[0])
                 agent.message[:] = action[1:]
@@ -716,15 +488,15 @@ class Warehouse(gym.Env):
                 agent.req_action = Action(action)
 
         # # stationary agents will certainly stay where they are
-        # stationary_agents = [agent for agent in self.agents if agent.action != Action.FORWARD]
+        # stationary_agents = [agent for agent in self.agents_obj if agent.action != Action.FORWARD]
 
         # # forward agents will move only if they avoid collisions
-        # forward_agents = [agent for agent in self.agents if agent.action == Action.FORWARD]
+        # forward_agents = [agent for agent in self.agents_obj if agent.action == Action.FORWARD]
         commited_agents = set()
 
         G = nx.DiGraph()
 
-        for agent in self.agents:
+        for agent in self.agents_obj.values():
             start = agent.x, agent.y
             target = agent.req_location(self.grid_size)
 
@@ -734,8 +506,8 @@ class Warehouse(gym.Env):
                 and self.grid[_LAYER_SHELFS, target[1], target[0]]
                 and not (
                     self.grid[_LAYER_AGENTS, target[1], target[0]]
-                    and self.agents[
-                        self.grid[_LAYER_AGENTS, target[1], target[0]] - 1
+                    and self.agents_obj[
+                        self.agents[self.grid[_LAYER_AGENTS, target[1], target[0]] - 1]
                     ].carrying_shelf
                 )
             ):
@@ -774,13 +546,14 @@ class Warehouse(gym.Env):
         commited_agents = set([self.agents[id_ - 1] for id_ in commited_agents])
         failed_agents = set(self.agents) - commited_agents
 
-        for agent in failed_agents:
+        for agent_id in failed_agents:
+            agent = self.agents_obj[agent_id]
             assert agent.req_action == Action.FORWARD
             agent.req_action = Action.NOOP
 
-        rewards = np.zeros(self.n_agents)
+        rewards = np.zeros(self.num_agents)
 
-        for agent in self.agents:
+        for agent in self.agents_obj.values():
             agent.prev_x, agent.prev_y = agent.x, agent.y
 
             if agent.req_action == Action.FORWARD:
@@ -815,7 +588,7 @@ class Warehouse(gym.Env):
             # a shelf was successfully delived.
             shelf_delivered = True
             # remove from queue and replace it
-            new_request = np.random.choice(
+            new_request = self.np_random.choice(
                 list(set(self.shelfs) - set(self.request_queue))
             )
             self.request_queue[self.request_queue.index(shelf)] = new_request
@@ -827,7 +600,7 @@ class Warehouse(gym.Env):
                 rewards[agent_id - 1] += 1
             elif self.reward_type == RewardType.TWO_STAGE:
                 agent_id = self.grid[_LAYER_AGENTS, x, y]
-                self.agents[agent_id - 1].has_delivered = True
+                self.agents_obj[self.agents[agent_id - 1]].has_delivered = True
                 rewards[agent_id - 1] += 0.5
 
         if shelf_delivered:
@@ -836,17 +609,25 @@ class Warehouse(gym.Env):
             self._cur_inactive_steps += 1
         self._cur_steps += 1
 
-        if (
-            self.max_inactivity_steps
-            and self._cur_inactive_steps >= self.max_inactivity_steps
-        ) or (self.max_steps and self._cur_steps >= self.max_steps):
-            dones = self.n_agents * [True]
-        else:
-            dones = self.n_agents * [False]
+        observations = {agent_id: self._make_obs(agent_id)
+                        for agent_id in self.agents}
+        rewards = dict(zip(self.agents, rewards))
+        # NB. not 100% sure that inactivity should lead to truncation rather than termination
+        terminated = False
+        truncated = (
+            (
+                bool(self.max_inactivity_steps)
+                and self._cur_inactive_steps >= self.max_inactivity_steps
+            ) or (
+                bool(self.max_steps)
+                and self._cur_steps >= self.max_steps
+            )
+        )
+        terminations = {agent_id: terminated for agent_id in self.agents}
+        truncations = {agent_id: truncated for agent_id in self.agents}
+        infos = {agent_id: {} for agent_id in self.agents}
 
-        new_obs = tuple([self._make_obs(agent) for agent in self.agents])
-        info = {}
-        return new_obs, list(rewards), dones, info
+        return observations, rewards, terminations, truncations, infos
 
     def render(self, mode="human"):
         if not self.renderer:
@@ -860,21 +641,93 @@ class Warehouse(gym.Env):
             self.renderer.close()
 
     def seed(self, seed=None):
-        ...
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent):
+        # depends on whether we're using image_obs, slow_obs, or fast_obs
+        if self.image_obs:
+            observation_shape = (1 + 2 * self.sensor_range, 1 + 2 * self.sensor_range)
+
+            layers_min = []
+            layers_max = []
+            for layer in image_observation_layers:
+                if layer == ImageLayer.AGENT_DIRECTION:
+                    # directions as int
+                    layer_min = np.zeros(observation_shape, dtype=np.float32)
+                    layer_max = np.ones(observation_shape, dtype=np.float32) * max([d.value + 1 for d in Direction])
+                else:
+                    # binary layer
+                    layer_min = np.zeros(observation_shape, dtype=np.float32)
+                    layer_max = np.ones(observation_shape, dtype=np.float32)
+                layers_min.append(layer_min)
+                layers_max.append(layer_max)
+
+            # total observation
+            min_obs = np.stack(layers_min)
+            max_obs = np.stack(layers_max)
+            return spaces.Box(min_obs, max_obs, dtype=np.float32)
+        else:
+            if self.normalised_coordinates:
+                location_space = spaces.Box(
+                        low=0.0,
+                        high=1.0,
+                        shape=(2,),
+                        dtype=np.float32,
+                )
+            else:
+                location_space = spaces.MultiDiscrete(
+                    [self.grid_size[1], self.grid_size[0]]
+                )
+
+            self_dict = {
+                "location": location_space,
+                "carrying_shelf": spaces.MultiDiscrete([2]),
+                "direction": spaces.Discrete(4),
+                "on_highway": spaces.MultiBinary(1),
+                }
+            sensor_dict = {
+                "has_agent": spaces.MultiBinary(1),
+                "direction": spaces.Discrete(4),
+                "has_shelf": spaces.MultiBinary(1),
+                "shelf_requested": spaces.MultiBinary(1),
+                }
+            if self.msg_bits > 0:
+                sensor_dict["local_message"] = spaces.MultiBinary(self.msg_bits)
+
+            obs_space = spaces.Dict({
+                "self": spaces.Dict(self_dict),
+                "sensors": spaces.Tuple(
+                    self._obs_sensor_locations * (spaces.Dict(sensor_dict),)
+                ),
+            })
+
+            if self.fast_obs:
+                return spaces.Box(
+                    low=-float("inf"),
+                    high=float("inf"),
+                    shape=(spaces.flatdim(obs_space),),
+                    dtype=np.float32,
+                )
+            else:
+                return obs_space
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent):
+        action_space = [len(Action), *self.msg_bits * (2,)]
+        if len(action_space) == 1:
+            return spaces.Discrete(action_space[0])
+        else:
+            return spaces.MultiDiscrete(action_space)
     
 
-if __name__ == "__main__":
-    env = Warehouse(9, 8, 3, 10, 3, 1, 5, None, None, RewardType.GLOBAL)
-    env.reset()
-    import time
-    from tqdm import tqdm
+    @property
+    def observation_spaces(self):
+        return {agent: self.observation_space(agent)
+                for agent in self.possible_agents}
 
-    time.sleep(2)
-    # env.render()
-    # env.step(18 * [Action.LOAD] + 2 * [Action.NOOP])
-
-    for _ in tqdm(range(1000000)):
-        # time.sleep(2)
-        # env.render()
-        actions = env.action_space.sample()
-        env.step(actions)
+    @property
+    def action_spaces(self):
+        return {agent: self.action_space(agent)
+                for agent in self.possible_agents}

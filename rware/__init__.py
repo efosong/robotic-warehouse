@@ -1,5 +1,6 @@
 import gym
-from .warehouse import Warehouse, RewardType, Action, ObserationType
+from .warehouse import Warehouse, RewardType, Action, ObservationType
+from .warehouse_zoo import parallel_env
 import itertools
 
 _sizes = {
@@ -34,7 +35,7 @@ for size, diff, agents in _perms:
 
 
 def image_registration():
-    _observation_type = {"": ObserationType.FLATTENED, "-img": ObserationType.IMAGE}
+    _observation_type = {"": ObservationType.FLATTENED, "-img": ObservationType.IMAGE}
     _image_directional = {"": True, "-Nd": False}
     _perms = itertools.product(_sizes.keys(), _difficulty, _observation_type, _image_directional, range(1, 20),)
     for size, diff, obs_type, directional, agents in _perms:
@@ -65,7 +66,7 @@ def image_registration():
 
 
 def full_registration():
-    _observation_type = {"": ObserationType.FLATTENED, "-img": ObserationType.IMAGE}
+    _observation_type = {"": ObservationType.FLATTENED, "-img": ObservationType.IMAGE}
     _sensor_ranges = {f"-{sight}s": sight for sight in range(2, 6)}
     _sensor_ranges[""] = 1
     _image_directional = {"": True, "-Nd": False}
