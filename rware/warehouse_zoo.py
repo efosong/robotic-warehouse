@@ -3,10 +3,9 @@ import logging
 import functools
 from collections import defaultdict, OrderedDict
 from copy import copy
-import gym
-from gym import spaces
+from gymnasium import spaces
 
-from gym.utils import seeding
+from gymnasium.utils import seeding
 from pettingzoo import ParallelEnv
 from pettingzoo.utils import wrappers
 from pettingzoo.utils import parallel_to_aec
@@ -74,6 +73,8 @@ class WarehouseZoo(ParallelEnv):
         ],
         image_observation_directional: bool=True,
         normalised_coordinates: bool=False,
+        render_mode: str="rgb_array",
+        render_style: str="simple",
     ):
         """The robotic warehouse environment
 
@@ -188,6 +189,8 @@ class WarehouseZoo(ParallelEnv):
             )
 
         self.renderer = None
+        self.render_mode = render_mode
+        self.render_style = render_style
 
     def _make_layout_from_params(self, shelf_columns, shelf_rows, column_height):
         assert shelf_columns % 2 == 1, "Only odd number of shelf columns is supported"
@@ -474,7 +477,10 @@ class WarehouseZoo(ParallelEnv):
             self.np_random.choice(self.shelfs, size=self.request_queue_size, replace=False)
         )
 
-        return {agent: self._make_obs(agent) for agent in self.agents}
+        obs = {agent: self._make_obs(agent) for agent in self.agents}
+        infos = {agent_id: {} for agent_id in self.agents}
+
+        return obs, infos
 
     def step(self, actions):
         assert len(actions) == len(self.agents)
@@ -629,16 +635,26 @@ class WarehouseZoo(ParallelEnv):
 
         return observations, rewards, terminations, truncations, infos
 
-    def render(self, mode="human"):
-        if not self.renderer:
-            from rware.rendering import Viewer
-
+    def _init_render(self):
+        if self.render_style == "full":
+            from .rendering import Viewer
             self.renderer = Viewer(self.grid_size)
-        return self.renderer.render(self, return_rgb_array=mode == "rgb_array")
+        elif self.render_style == "simple":
+            from .simple_render import render
+            self.renderer = render
+
+    def render(self):
+        if not self.renderer:
+            self._init_render()
+        if self.render_style == "full":
+            return self.renderer.render(self, return_rgb_array=True)
+        elif self.render_style == "simple":
+            return self.renderer(self)
 
     def close(self):
-        if self.renderer:
-            self.renderer.close()
+        if self.render_style == "full":
+            if self.renderer:
+                self.renderer.close()
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)

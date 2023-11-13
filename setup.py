@@ -16,17 +16,25 @@ setup(
     url="https://github.com/semitable/robotic-warehouse",
     packages=find_packages(exclude=["contrib", "docs", "tests"]),
     classifiers=[
-        "Development Status :: 4 - Beta",
-        # Indicate who your project is intended for
         "Intended Audience :: Developers",
+        "Programming Language :: Python :: 3.4",
+        "Programming Language :: Python :: 3.5",
+        "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
     ],
     install_requires=[
-        "numpy",
-        "gym>=0.26.2",
-        "pyglet",
+        "numpy>=1.23.1",
+        "gymnasium>=0.26.2",
+        "pettingzoo>=1.23.0",
+        "pillow",
         "networkx",
     ],
-    extras_require={"test": ["pytest"]},
+    extras_require={
+        "test": ["pytest"],
+        "full_render": ["pyglet<2"],
+    },
     include_package_data=True,
 )
